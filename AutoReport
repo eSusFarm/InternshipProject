@@ -1,0 +1,176 @@
+#install libraries
+!pip install azure-storage-blob slack_sdk pandas
+!pip install apscheduler
+!pip install pandas pyodbc sqlalchemy schedule
+
+import datetime
+import pandas as pd
+import pyodbc
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from azure.storage.blob import BlobServiceClient
+from apscheduler.schedulers.blocking import BlockingScheduler
+
+# Azure Blob Storage details
+STORAGE_ACCOUNT_NAME = 'Your Account Name'
+STORAGE_ACCOUNT_KEY = 'Your Storage Account Key'
+CONTAINER_NAME = 'Your Container Name'
+# List of file names in blob storage 
+BLOB_FILE_NAMES = [
+    'Buyer/CombineBuyers.csv',
+    'Equipment/CombineEquipment.csv',
+    'Farmers/CombineFarmers.csv',
+    'SupportUser/CombineSupportUser.csv'
+]
+# Slack credentials
+SLACK_TOKEN = 'Your Slack token' 
+CHANNEL_ID = 'Your Slack Channel'  
+
+# Function to download data from Azure Blob Storage and load into a dictionary of DataFrames
+def download_data_from_blob(blob_file_names):
+    # Initialize the blob service client
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
+        credential=STORAGE_ACCOUNT_KEY
+    )
+
+    # Initialize the container client
+    container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+
+    # Dictionary to store DataFrames for each file
+    dataframes = {}
+
+    # Loop through each file name, download it, and load it into a DataFrame
+    for file_name in blob_file_names:
+        # Create a blob client for each file
+        blob_client = container_client.get_blob_client(file_name)
+        download_file_path = f"./{file_name.split('/')[-1]}"  # Save with just the file name
+
+        # Download the file locally
+        with open(download_file_path, "wb") as download_file:
+            download_file.write(blob_client.download_blob().readall())
+
+        # Load the downloaded file into a DataFrame
+        dataframes[file_name] = pd.read_csv(download_file_path)
+
+    return dataframes
+
+# Call the function and assign the returned dictionary to 'dataframes'
+dataframes = download_data_from_blob(BLOB_FILE_NAMES)
+
+# Now you can access individual DataFrames by file path
+df1 = dataframes[BLOB_FILE_NAMES[0]]  # Buyers
+df2 = dataframes[BLOB_FILE_NAMES[1]]  # Equipment
+df3 = dataframes[BLOB_FILE_NAMES[2]]  # Farmers
+df4 = dataframes[BLOB_FILE_NAMES[3]]  # UserLogged
+
+
+# Functions to get counts for each type df1-df3
+def get_counts(df):
+    today = datetime.datetime.now().date()
+    yesterday = today - datetime.timedelta(days=1)
+    week_last_start = today - datetime.timedelta(days=7)
+    month_start = today.replace(day=1)
+
+    df['CreatedDate'] = pd.to_datetime(df['CreatedDate']).dt.date
+    new_yesterday = df[df['CreatedDate'] == yesterday].shape[0]
+    new_last_week = df[df['CreatedDate'] >= week_last_start].shape[0]
+    new_this_month = df[df['CreatedDate'] >= month_start].shape[0]
+
+    return new_yesterday, new_last_week, new_this_month
+
+
+df4['CreatedDate'] = pd.to_datetime(df4['CreatedDate'])
+
+
+# Calculate counts for df4
+def calculate_daily_logins(df4):
+    today = datetime.datetime.now().date()
+    yesterday = today - datetime.timedelta(days=1)
+    week_start = today - datetime.timedelta(days=7)
+    month_start = today.replace(day=1)
+
+    # Count unique logins for yesterday
+    yesterday_logins = df4[df4['CreatedDate'].dt.date == yesterday]['UserId'].nunique()
+
+    # Count unique logins for the last week
+    last_week_logins = df4[df4['CreatedDate'].dt.date >= week_start]['UserId'].nunique()
+
+    # Count unique logins for the current month
+    month_logins = df4[df4['CreatedDate'].dt.date >= month_start]['UserId'].nunique()
+
+    return yesterday_logins, last_week_logins, month_logins
+
+
+# Calculating counts for each type of data
+new_buyers_yesterday, new_buyers_last_week, new_buyers_this_month = get_counts(df1)
+new_equipment_yesterday, new_equipment_last_week, new_equipment_this_month = get_counts(df2)
+new_farmers_yesterday, new_farmers_last_week, new_farmers_this_month = get_counts(df3)
+yesterday_logins, last_week_logins, month_logins = calculate_daily_logins(df4)
+
+# Display or use these results as needed df1-df3
+print("New Buyers Yesterday:", new_buyers_yesterday)
+print("New Buyers Last Week:", new_buyers_last_week)
+print("New Buyers This Month:", new_buyers_this_month)
+print("New Equipment Yesterday:", new_equipment_yesterday)
+print("New Equipment Last Week:", new_equipment_last_week)
+print("New Equipment This Month:", new_equipment_this_month)
+print("New Farmers Yesterday:", new_farmers_yesterday)
+print("New Farmers Last Week:", new_farmers_last_week)
+print("New Farmers This Month:", new_farmers_this_month)
+
+
+
+def post_to_slack(report_title, yesterday_count, lastweek_count, month_count=None):
+    client = WebClient(token=SLACK_TOKEN)
+
+    if month_count is not None:
+        # For general daily reports with yesterday, last week, and month counts
+        report = (
+            f"📊 *{report_title}*\n"
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"- New Yesterday: {yesterday_count}\n"
+            f"- New Last Week: {lastweek_count}\n"
+            f"- New This Month: {month_count}"
+        )
+    else:
+        # For daily login report with only yesterday and last week counts
+        report = (
+            f"📊 *{report_title}*\n"
+            f"Date: {datetime.datetime.now().strftime('%Y-%m-%d')}\n"
+            f"- Total Logins Yesterday: {yesterday_count}\n"
+            f"- Total Logins Last Week: {lastweek_count}"
+        )
+
+    try:
+        response = client.chat_postMessage(channel=CHANNEL_ID, text=report)
+        print(f"Message posted: {response['message']['text']}")
+    except SlackApiError as e:
+        print(f"Error posting message: {e.response['error']}")
+
+def daily_report():
+    print("Starting daily report...")
+
+    # Calculate counts for each DataFrame and post to Slack
+    new_buyers_yesterday, new_buyers_last_week, new_buyers_this_month = get_counts(dataframes['Buyer/CombineBuyers.csv'])
+    post_to_slack("Daily Buyer Report", new_buyers_yesterday, new_buyers_last_week, new_buyers_this_month)
+
+    new_equipment_yesterday, new_equipment_last_week, new_equipment_this_month = get_counts(dataframes['Equipment/CombineEquipment.csv'])
+    post_to_slack("Daily Equipment Report", new_equipment_yesterday, new_equipment_last_week, new_equipment_this_month)
+
+    new_farmers_yesterday, new_farmers_last_week, new_farmers_this_month = get_counts(dataframes['Farmers/CombineFarmers.csv'])
+    post_to_slack("Daily Farmer Report", new_farmers_yesterday, new_farmers_last_week, new_farmers_this_month)
+
+    # For Daily Login Report, we might not have a month count, so we pass None
+    yesterday_logins, last_week_logins, month_logins = get_counts(dataframes['SupportUser/CombineSupportUser.csv'])
+    post_to_slack("Daily Login Report", yesterday_logins, last_week_logins, month_logins)
+
+
+# Set up the scheduler
+scheduler = BlockingScheduler(timezone="Africa/Harare")
+scheduler.add_job(daily_report, 'cron', hour=9, minute=00)
+
+print("Scheduler started. The report will post daily at 9:00 AM CAT.")  # for now daylight time saving run at Midnight EST Time
+scheduler.start()
+
+# Midnight DayLight_TimeSaving 7hours different
